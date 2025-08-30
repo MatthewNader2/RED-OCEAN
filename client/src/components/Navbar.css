@@ -1,0 +1,84 @@
+/* File: src/components/Navbar.css */
+.navbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0 40px;
+    height: 60px;
+    background-color: rgba(255, 255, 255, 0.9);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+    backdrop-filter: blur(5px);
+    position: sticky;
+    /* Makes the navbar stick to the top */
+    top: 0;
+    z-index: 100;
+    /* Ensures it stays above other content */
+}
+
+.navbar-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 1.4rem;
+    font-weight: 700;
+    color: #0056b3;
+}
+
+.navbar-links {
+    display: flex;
+    gap: 30px;
+}
+
+.navbar-links a {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    text-decoration: none;
+    color: #555;
+    font-weight: 500;
+    padding: 10px;
+    border-bottom: 2px solid transparent;
+    transition: color 0.2s, border-bottom-color 0.2s;
+}
+
+.navbar-links a:hover {
+    color: #007bff;
+}
+
+.navbar-links a.active {
+    color: #007bff;
+    border-bottom-color: #007bff;
+}
+
+/* --- Responsive Media Queries --- */
+
+/* For tablets */
+@media (max-width: 768px) {
+    .navbar {
+        padding: 0 20px;
+        /* Reduce side padding */
+    }
+
+    .navbar-brand {
+        font-size: 1.2rem;
+        /* Slightly smaller brand text */
+    }
+
+    .navbar-links {
+        gap: 15px;
+        /* Reduce space between links */
+    }
+}
+
+/* For mobile phones */
+@media (max-width: 480px) {
+    .navbar-links a span {
+        display: none;
+        /* Hide the text label on mobile */
+    }
+
+    .navbar-links a {
+        font-size: 1.2rem;
+        /* Make icons slightly larger */
+    }
+}
