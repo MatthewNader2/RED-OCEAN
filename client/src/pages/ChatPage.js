@@ -1,14 +1,12 @@
-// File: src/Chat.js
+// File: src/pages/ChatPage.js
 import React, { useState, useEffect, useRef } from "react";
 import axios from "axios";
-import "./Chat.css"; // Import the new stylesheet
+import "./Chat.css";
 
-// --- The Redesigned Property Card Component ---
+// --- The Redesigned Property Card Component (no changes) ---
 const PropertyCard = ({ property }) => {
   if (!property || !property.Property) return null;
   const prop = property.Property;
-
-  // Use a placeholder image service. The 'seed' makes the image consistent for the same property.
   const imageUrl = `https://picsum.photos/seed/${prop.totalArea}/400/200`;
 
   return (
@@ -48,58 +46,132 @@ const PropertyCard = ({ property }) => {
   );
 };
 
-const Chat = () => {
+// --- Main Chat Page Component ---
+const ChatPage = () => {
   const [message, setMessage] = useState("");
   const [chatHistory, setChatHistory] = useState([
-    // Start with a welcome message from the AI
     {
-      role: "ai",
+      role: "assistant",
       text: "Hello! I'm your real estate assistant. How can I help you find the perfect property today?",
       suggestions: [],
+      entity: null,
     },
   ]);
   const [isLoading, setIsLoading] = useState(false);
+  const [isListening, setIsListening] = useState(false);
   const chatHistoryRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
 
-  // Effect to auto-scroll to the latest message
   useEffect(() => {
     if (chatHistoryRef.current) {
       chatHistoryRef.current.scrollTop = chatHistoryRef.current.scrollHeight;
     }
   }, [chatHistory]);
 
+  const handleResponse = (result) => {
+    const userMessage = { role: "user", text: result.transcript };
+    const assistantMessage = {
+      role: "assistant",
+      text: result.summary,
+      suggestions: result.suggestions || [],
+      entity: result.entity || null, // <-- CRITICAL: Save the entity for context
+    };
+    setChatHistory((prev) => [...prev, userMessage, assistantMessage]);
+  };
+
+  const handleError = (error) => {
+    console.error("Error processing request:", error);
+    const errorMessage = {
+      role: "assistant",
+      text:
+        error.response?.data?.error ||
+        "Sorry, I am having trouble connecting. Please try again.",
+      suggestions: [],
+    };
+    setChatHistory((prev) => [...prev, errorMessage]);
+  };
+
+  // --- Text Input Submission ---
   const sendMessage = async (e) => {
     e.preventDefault();
     if (!message.trim()) return;
 
-    const userMessage = { role: "user", text: message };
-    setChatHistory((prev) => [...prev, userMessage]);
+    const userQuery = message;
+    setChatHistory((prev) => [...prev, { role: "user", text: userQuery }]);
     setIsLoading(true);
     setMessage("");
 
     try {
       const response = await axios.post("http://localhost:5000/api/chat", {
-        userQuery: message,
-        chatHistory: chatHistory,
+        userQuery,
+        chatHistory,
       });
-
-      const { summary, suggestions } = response.data;
-      const aiMessage = {
-        role: "ai",
-        text: summary,
-        suggestions: suggestions || [],
-      };
-      setChatHistory((prev) => [...prev, aiMessage]);
+      handleResponse(response.data);
     } catch (error) {
-      console.error("Error sending message:", error);
-      const errorMessage = {
-        role: "ai",
-        text: "Sorry, I am having trouble connecting. Please try again.",
-        suggestions: [],
-      };
-      setChatHistory((prev) => [...prev, errorMessage]);
+      handleError(error);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  // --- Voice Input Submission ---
+  const processAudio = async (audioBlob) => {
+    setIsLoading(true);
+    const formData = new FormData();
+    formData.append("audio", audioBlob, "audio.webm");
+    formData.append("metadata", JSON.stringify({ chatHistory }));
+
+    try {
+      const response = await axios.post(
+        "http://localhost:5000/api/chat-speech",
+        formData,
+        {
+          headers: { "Content-Type": "multipart/form-data" },
+        }
+      );
+      handleResponse(response.data);
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleVoiceInput = async () => {
+    if (isListening) {
+      mediaRecorderRef.current.stop();
+      setIsListening(false);
+    } else {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+        });
+        mediaRecorderRef.current = new MediaRecorder(stream, {
+          mimeType: "audio/webm",
+        });
+        audioChunksRef.current = [];
+
+        mediaRecorderRef.current.ondataavailable = (event) => {
+          audioChunksRef.current.push(event.data);
+        };
+
+        mediaRecorderRef.current.onstop = () => {
+          const audioBlob = new Blob(audioChunksRef.current, {
+            type: "audio/webm",
+          });
+          processAudio(audioBlob);
+          stream.getTracks().forEach((track) => track.stop());
+        };
+
+        mediaRecorderRef.current.start();
+        setIsListening(true);
+      } catch (err) {
+        console.error("Microphone access error:", err);
+        alert(
+          "Microphone access was denied. Please allow access in your browser settings."
+        );
+      }
     }
   };
 
@@ -113,28 +185,47 @@ const Chat = () => {
         {chatHistory.map((msg, index) => (
           <div key={index} className={`message-wrapper ${msg.role}`}>
             <div className={`message-bubble ${msg.role}`}>{msg.text}</div>
-            {msg.role === "ai" &&
+            {msg.role === "assistant" &&
               msg.suggestions &&
               msg.suggestions.length > 0 && (
                 <div className="suggestions-container">
-                  {msg.suggestions.map((suggestion, idx) => (
-                    <PropertyCard key={idx} property={suggestion} />
+                  {msg.suggestions.map((suggestion) => (
+                    <PropertyCard
+                      key={suggestion.uniqueId}
+                      property={suggestion}
+                    />
                   ))}
                 </div>
               )}
           </div>
         ))}
+        {isListening && <div className="listening-indicator">Listening...</div>}
+        {isLoading && !isListening && (
+          <div className="listening-indicator">Thinking...</div>
+        )}
       </div>
       <form onSubmit={sendMessage} className="chat-form">
+        <button
+          type="button"
+          onClick={handleVoiceInput}
+          className={`mic-button ${isListening ? "listening" : ""}`}
+          disabled={isLoading}
+        >
+          <i className="fas fa-microphone"></i>
+        </button>
         <input
           type="text"
           className="chat-input"
           value={message}
           onChange={(e) => setMessage(e.target.value)}
-          placeholder="Ask me anything..."
-          disabled={isLoading}
+          placeholder="Ask me anything or use the mic..."
+          disabled={isLoading || isListening}
         />
-        <button type="submit" className="send-button" disabled={isLoading}>
+        <button
+          type="submit"
+          className="send-button"
+          disabled={isLoading || isListening || !message.trim()}
+        >
           <i className="fas fa-paper-plane"></i>
         </button>
       </form>
@@ -142,4 +233,4 @@ const Chat = () => {
   );
 };
 
-export default Chat;
+export default ChatPage;

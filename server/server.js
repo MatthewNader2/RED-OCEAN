@@ -3,9 +3,8 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import fs from "fs/promises";
+import multer from "multer"; // Added for file uploads
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import { MemoryVectorStore } from "langchain/vectorstores/memory";
-import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai";
 
 dotenv.config();
 
@@ -14,51 +13,43 @@ const PORT = process.env.PORT || 5000;
 
 // --- Initializations ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const textEmbeddingModel = new GoogleGenerativeAIEmbeddings({
-  model: "text-embedding-004",
-  apiKey: process.env.GEMINI_API_KEY,
+
+// --- Multer Configuration for Speech Input ---
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fieldSize: 10 * 1024 * 1024, // 10 MB
+  },
 });
 
 // --- CACHING IMPLEMENTATION ---
-let vectorStore;
 let allProperties = [];
+let dynamicFilters = { locations: [], types: [] };
 
 // Immediately invoke the data initialization.
 initializeData();
 
-// --- Data Loading and Vector Store Initialization ---
+// --- Data Loading and Dynamic Filter Generation ---
 async function initializeData() {
   console.log("Loading, processing, and caching property data...");
   try {
     const jsonData = await fs.readFile("./red ocean.json", "utf-8");
-    // FIX: Add uniqueId to each property right after loading
     allProperties = JSON.parse(jsonData).map((p, index) => ({
       ...p,
       uniqueId: index,
     }));
 
-    const documents = allProperties.map((item) => {
-      const prop = item.Property;
-      const pageContent = `
-            Property in ${prop.location} of type ${prop.type}.
-            It has ${prop.bedrooms} bedrooms and ${prop.bathrooms} bathrooms.
-            The total area is ${prop.totalArea} sq. units.
-            Key features include: ${prop.keyFeatures}. Amenities include: ${prop.amenities}.
-            The market risk is rated as ${prop.riskAssessment.marketRisk} and the developer risk is ${prop.riskAssessment.developerRisk}.
-            The total Return on Investment (ROI) is ${prop.roi.totalROI}%.
-        `;
-      return {
-        pageContent,
-        // FIX: Ensure uniqueId is in the vector store metadata
-        metadata: { type: "property", ...prop, uniqueId: item.uniqueId },
-      };
+    const locations = new Set();
+    const types = new Set();
+    allProperties.forEach((p) => {
+      if (p.Property.location) locations.add(p.Property.location);
+      if (p.Property.type) types.add(p.Property.type);
     });
-
-    console.log("Creating vector store in memory...");
-    vectorStore = await MemoryVectorStore.fromDocuments(
-      documents,
-      textEmbeddingModel
-    );
+    dynamicFilters = {
+      locations: [...locations],
+      types: [...types],
+    };
+    console.log("Dynamic filters generated:", dynamicFilters);
     console.log("✅ Data has been successfully cached.");
   } catch (error) {
     console.error("----------- FAILED TO INITIALIZE DATA -----------", error);
@@ -69,285 +60,343 @@ async function initializeData() {
 app.use(cors());
 app.use(express.json());
 
-// --- Endpoint to get all property data ---
+// --- Helper Functions ---
+async function generateWithRetry(model, request, maxRetries = 3) {
+  let attempt = 0;
+  while (attempt < maxRetries) {
+    try {
+      const result = await model.generateContent(request);
+      return result;
+    } catch (error) {
+      attempt++;
+      console.warn(
+        `API call failed on attempt ${attempt}/${maxRetries}. Error: ${error.message}`
+      );
+      if (attempt >= maxRetries) {
+        console.error("API call failed after all retries.");
+        throw error;
+      }
+      const delay = Math.pow(2, attempt) * 1000;
+      console.log(`Retrying in ${delay}ms...`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
+
+// --- Main Chat Logic ---
+async function runConversation(userQuery, chatHistory) {
+  let context = { last_suggestions: null, last_entity: null };
+  if (chatHistory && chatHistory.length > 0) {
+    const lastTurn = chatHistory[chatHistory.length - 1];
+    if (lastTurn.role === "assistant") {
+      if (lastTurn.suggestions && lastTurn.suggestions.length > 0) {
+        context.last_suggestions = lastTurn.suggestions.map(
+          (s) => s.Property.location
+        );
+      }
+      if (lastTurn.entity) {
+        context.last_entity = lastTurn.entity;
+      }
+    }
+  }
+
+  const systemPrompt = `You are a world-class real estate AI assistant. Your goal is to understand a user's request and convert it into a structured JSON object to control a smart filter system.
+
+    ## CONTEXT
+    - Previous Turn Suggestions: The user was just looking at properties in: ${
+      JSON.stringify(context.last_suggestions) || "Nothing"
+    }.
+    - Last Discussed Entity: ${JSON.stringify(context.last_entity) || "None"}.
+  
+    ## AVAILABLE FILTERS
+    - Locations: ${dynamicFilters.locations.join(", ")}
+    - Types: ${dynamicFilters.types.join(", ")}
+  
+    ## INTENTS
+    - SEARCH_UNITS: To find, get, or see a list of units.
+    - ANALYZE_ENTITY: For questions ABOUT a location (e.g., "What do you know about Suite 57?").
+    - UNIT_DETAILS: For follow-up questions about units in the context (e.g., "what is its payment plan?").
+    - BEST_INVESTMENT_SEARCH: For "best investment" or "highest ROI".
+    - LOWEST_RISK_SEARCH: For "safest investment" or "lowest risk".
+  
+    ## RESPONSE FORMAT (JSON ONLY)
+    { "intent": "...", "parameters": { "location": "...", "type": "...", "sortBy": "...", "offset": 0 }, "thought": "..." }
+  
+    ## CRITICAL RULES
+    1.  **Context is Key:** If the user says "their cheapest unit" and 'Last Discussed Entity' is '{ "location": "Suite 57" }', you MUST set the location parameter: \`"parameters": { "location": "Suite 57", "sortBy": "cheapest" }\`.
+    2.  **Entity vs. Search:** "Tell me about Suite 95" -> ANALYZE_ENTITY. "Units in Suite 95" -> SEARCH_UNITS.
+    3.  **Ranking:** "best investment" -> BEST_INVESTMENT_SEARCH. "lowest risk" -> LOWEST_RISK_SEARCH. "cheapest" -> SEARCH_UNITS with sortBy: 'cheapest'.
+  
+    ## User Query: "${userQuery}"`;
+
+  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); // Using stable model
+  const planResult = await generateWithRetry(model, systemPrompt);
+  const cleanedResponse = planResult.response
+    .text()
+    .trim()
+    .replace(/```json/g, "")
+    .replace(/```/g, "");
+  const plan = JSON.parse(cleanedResponse);
+  console.log("AI Plan:", plan);
+
+  let executionResult;
+  let summaryPrompt;
+  let entityForNextTurn = null;
+
+  switch (plan.intent) {
+    case "SEARCH_UNITS":
+      let candidates = [...allProperties];
+      const params = plan.parameters;
+
+      if (params.location) {
+        candidates = candidates.filter(
+          (p) =>
+            p.Property.location &&
+            new RegExp(params.location, "i").test(p.Property.location)
+        );
+        entityForNextTurn = { location: params.location };
+      }
+      if (params.type) {
+        candidates = candidates.filter(
+          (p) =>
+            p.Property.type &&
+            new RegExp(params.type, "i").test(p.Property.type)
+        );
+      }
+
+      if (params.sortBy) {
+        switch (params.sortBy) {
+          case "most_expensive":
+            candidates.sort(
+              (a, b) =>
+                (b.Property.priceRange.min || 0) -
+                (a.Property.priceRange.min || 0)
+            );
+            break;
+          case "cheapest":
+            candidates.sort(
+              (a, b) =>
+                (a.Property.priceRange.min || Infinity) -
+                (b.Property.priceRange.min || Infinity)
+            );
+            break;
+        }
+      }
+      const offset = params.offset || 0;
+      executionResult = candidates.slice(offset, offset + 5);
+      summaryPrompt = `The user asked "${userQuery}". The filter returned these results. Formulate a friendly, human-like response summarizing the findings. Mention the top result specifically.\n\nDATA:\n${JSON.stringify(
+        executionResult.map((p) => ({
+          location: p.Property.location,
+          price: p.Property.priceRange.min,
+          type: p.Property.type,
+        }))
+      )}`;
+      break;
+
+    case "BEST_INVESTMENT_SEARCH":
+      executionResult = [...allProperties]
+        .sort(
+          (a, b) =>
+            (b.Property.roi.totalROI || 0) - (a.Property.roi.totalROI || 0)
+        )
+        .slice(0, 5);
+      summaryPrompt = `The user asked for the best investment. The system found these properties with the highest Total ROI. Formulate a concise response highlighting the top result.\n\nDATA:\n${JSON.stringify(
+        executionResult.map((p) => ({
+          location: p.Property.location,
+          totalROI: p.Property.roi.totalROI,
+        }))
+      )}`;
+      break;
+
+    case "LOWEST_RISK_SEARCH":
+      const getRiskScore = (prop) => {
+        let score = 0;
+        if (prop.riskAssessment.marketRisk === "Low") score += 1;
+        if (prop.riskAssessment.marketRisk === "Medium") score += 2;
+        if (prop.riskAssessment.marketRisk === "High") score += 3;
+        return score;
+      };
+      executionResult = [...allProperties]
+        .sort((a, b) => getRiskScore(a.Property) - getRiskScore(b.Property))
+        .slice(0, 5);
+      summaryPrompt = `The user asked for the lowest risk investment. The system found these properties. Formulate a concise response highlighting the top result.\n\nDATA:\n${JSON.stringify(
+        executionResult.map((p) => ({
+          location: p.Property.location,
+          marketRisk: p.Property.riskAssessment.marketRisk,
+        }))
+      )}`;
+      break;
+
+    case "ANALYZE_ENTITY":
+      const entityName = plan.parameters.location;
+      entityForNextTurn = { location: entityName };
+
+      const matchingProps = allProperties.filter(
+        (p) =>
+          p.Property.location &&
+          new RegExp(entityName, "i").test(p.Property.location)
+      );
+      if (matchingProps.length > 0) {
+        executionResult = matchingProps;
+        summaryPrompt = `The user asked about "${entityName}". Based ONLY on the following data, provide a detailed, human-like answer.\n\nDATA:\n${JSON.stringify(
+          matchingProps[0].Property
+        )}`;
+      } else {
+        executionResult = [];
+        summaryPrompt = `The user asked about "${entityName}", but I couldn't find any data for it. Please inform the user politely.`;
+      }
+      break;
+
+    case "UNIT_DETAILS":
+      const lastSuggestions = chatHistory[chatHistory.length - 1]?.suggestions;
+      if (lastSuggestions && lastSuggestions.length > 0) {
+        const contextProp = lastSuggestions[0];
+        executionResult = [contextProp];
+        summaryPrompt = `The user asked a follow-up question: "${userQuery}". The context is this property's data. Based ONLY on this data, provide a direct, concise answer.\n\nCRITICAL RULE: If the provided DATA does not contain the answer, you MUST state that the information is not available.\n\nDATA:\n${JSON.stringify(
+          contextProp.Property
+        )}`;
+      } else {
+        executionResult = [];
+        summaryPrompt = `The user asked a follow-up question, but there's no property in context. Politely ask them what they're referring to.`;
+      }
+      break;
+
+    default:
+      executionResult = [];
+      summaryPrompt = `I'm not sure how to handle that request. Please ask the user to rephrase.`;
+  }
+
+  const summaryResult = await generateWithRetry(model, summaryPrompt);
+  const summaryText = summaryResult.response.text().trim();
+
+  return {
+    summary: summaryText,
+    suggestions: executionResult.slice(0, 3),
+    entity: entityForNextTurn,
+  };
+}
+
+// --- API Endpoints ---
 app.get("/api/properties", (req, res) => {
   if (allProperties.length > 0) {
     res.json(allProperties);
   } else {
-    res
-      .status(503)
-      .json({
-        error:
-          "Property data is not yet available. Please try again in a moment.",
-      });
+    res.status(503).json({ error: "Property data is not yet available." });
   }
 });
 
-// --- Main Chat Endpoint ---
 app.post("/api/chat", async (req, res) => {
   try {
-    const { userQuery } = req.body;
+    const { userQuery, chatHistory } = req.body;
     if (!userQuery) {
       return res.status(400).json({ error: "userQuery is required" });
     }
 
+    console.log(`\n--- New request on /api/chat (text) ---`);
     console.log(`Received query: ${userQuery}`);
 
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-lite" });
-
-    // --- 1. Intent Recognition ---
-    const intentPrompt = `
-      You are a highly intelligent real estate AI assistant. Your primary function is to analyze a user's query and categorize it into a specific intent, extracting all relevant parameters.
-
-      **INTENT CATEGORIES & PARAMETERS:**
-
-      **1. Search & Filter Intents (Finding Properties):**
-      - **PRICE_RANGE_SEARCH**: User mentions a price or budget (e.g., "under 1M", "between 2M and 3M").
-      - **ROOM_RANGE_SEARCH**: User specifies a number of rooms (e.g., "3 bedrooms", "at least 2 rooms").
-      - **AREA_RANGE_SEARCH**: User specifies a size or area (e.g., "bigger than 1500 sq ft").
-      - **DELIVERY_DATE_SEARCH**: User asks about completion or delivery dates (e.g., "ready to move", "delivering in 2025").
-      - **TYPE_SEARCH**: User specifies a property type (e.g., "show me commercial properties", "any villas?").
-      - **MULTI_FILTER_SEARCH**: A combination of two or more of the above filters.
-      - **SEMANTIC_STYLE_SEARCH**: User uses subjective terms or asks about amenities (e.g., "something modern", "with a sea view", "does it have a pool?").
-
-      **2. Comparative & Ranking Intents ("Best Of"):**
-      - **CHEAPEST**: User asks for the lowest price properties.
-      - **MOST_EXPENSIVE**: User asks for the highest price properties.
-      - **MOST_ROOMS**: User asks for properties with the most bedrooms.
-      - **LARGEST_AREA**: User asks for the properties with the biggest area.
-      - **BEST_INVESTMENT**: User asks for the best investment or highest ROI.
-      - **HIGHEST_PROJECTED_VALUE**: User asks about future value or growth.
-      - **BEST_PRICE_PER_AREA**: User asks for the best value or most space for the money.
-      - **LOWEST_RISK**: User asks for the safest or lowest risk options.
-
-      **3. Specific Detail Intents (Follow-up Questions):**
-      - **SPECIFIC_PROPERTY_INQUIRY**: User asks a general question about a specific property they mention by name/location (e.g., "tell me more about the one in Suite 57").
-      - **PAYMENT_PLAN_INQUIRY**: User asks about the payment plan for a specific property.
-      - **ROI_DETAILS_INQUIRY**: User asks for specific ROI details (annual, total, etc.) for a property.
-
-      **4. Conversational Intents (The Chat):**
-      - **GREETING**: A simple greeting like "hello" or "hi".
-      - **FAREWELL**: A sign-off like "thanks" or "bye".
-      - **HELP_INQUIRY**: User asks about your capabilities (e.g., "what can you do?").
-      - **CONTACT_AGENT**: User wants to speak to a human.
-      - **OUT_OF_SCOPE**: The query is unrelated to real estate.
-
-      **PARAMETER EXTRACTION:**
-      - Extract any of the following values if mentioned: minPrice, maxPrice, minRooms, maxRooms, minArea, maxArea, type, deliveryYear, propertyName.
-
-      **RESPONSE FORMAT (JSON ONLY):**
-      {
-        "intent": "YOUR_CHOSEN_INTENT",
-        "parameters": { "...all extracted parameters..." },
-        "responseToUser": "A direct, conversational response ONLY for Conversational Intents."
-      }
-
-      **User Query: "${userQuery}"**
-    `;
-    const intentResult = await model.generateContent(intentPrompt);
-    const cleanedResponse = intentResult.response
-      .text()
-      .trim()
-      .replace(/```json/g, "")
-      .replace(/```/g, "");
-    const structuredQuery = JSON.parse(cleanedResponse);
-    console.log("Structured Query:", structuredQuery);
-
-    const { intent, parameters, responseToUser } = structuredQuery;
-    let suggestionsForUI = [];
-    let summaryTextToSpeak = "";
-
-    // --- 2. Fulfilling the Intent ---
-    if (responseToUser) {
-      summaryTextToSpeak = responseToUser;
-    } else {
-      // A. Handle simple, direct filter/sort intents
-      if (intent === "CHEAPEST") {
-        suggestionsForUI = [...allProperties]
-          .sort(
-            (a, b) =>
-              (a.Property.priceRange.min || Infinity) -
-              (b.Property.priceRange.min || Infinity)
-          )
-          .slice(0, 3);
-      } else if (intent === "MOST_EXPENSIVE") {
-        suggestionsForUI = [...allProperties]
-          .sort(
-            (a, b) =>
-              (b.Property.priceRange.min || 0) -
-              (a.Property.priceRange.min || 0)
-          )
-          .slice(0, 3);
-      } else if (intent === "MOST_ROOMS") {
-        suggestionsForUI = [...allProperties]
-          .sort(
-            (a, b) => (b.Property.bedrooms || 0) - (a.Property.bedrooms || 0)
-          )
-          .slice(0, 3);
-      } else if (intent === "LARGEST_AREA") {
-        suggestionsForUI = [...allProperties]
-          .sort(
-            (a, b) => (b.Property.totalArea || 0) - (a.Property.totalArea || 0)
-          )
-          .slice(0, 3);
-      } else if (intent === "BEST_INVESTMENT") {
-        suggestionsForUI = [...allProperties]
-          .sort(
-            (a, b) =>
-              (b.Property.roi.totalROI || 0) - (a.Property.roi.totalROI || 0)
-          )
-          .slice(0, 3);
-      } else if (intent === "HIGHEST_PROJECTED_VALUE") {
-        suggestionsForUI = [...allProperties]
-          .sort(
-            (a, b) =>
-              (b.Property.roi.projectedValue || 0) -
-              (a.Property.roi.projectedValue || 0)
-          )
-          .slice(0, 3);
-      } else if (intent === "BEST_PRICE_PER_AREA") {
-        suggestionsForUI = [...allProperties]
-          .filter(
-            (p) => p.Property.priceRange.min > 0 && p.Property.totalArea > 0
-          )
-          .sort(
-            (a, b) =>
-              a.Property.priceRange.min / a.Property.totalArea -
-              b.Property.priceRange.min / b.Property.totalArea
-          )
-          .slice(0, 3);
-      } else if (intent === "LOWEST_RISK") {
-        const getRiskScore = (prop) => {
-          let score = 0;
-          if (prop.riskAssessment.marketRisk === "Low") score += 1;
-          if (prop.riskAssessment.marketRisk === "Medium") score += 2;
-          if (prop.riskAssessment.marketRisk === "High") score += 3;
-          if (prop.riskAssessment.developerRisk === "Low") score += 1;
-          if (prop.riskAssessment.developerRisk === "Medium") score += 2;
-          if (prop.riskAssessment.developerRisk === "High") score += 3;
-          return score;
-        };
-        suggestionsForUI = [...allProperties]
-          .sort((a, b) => getRiskScore(a.Property) - getRiskScore(b.Property))
-          .slice(0, 3);
-      }
-      // B. Handle specific detail intents
-      else if (
-        intent.includes("SPECIFIC_PROPERTY") ||
-        intent.includes("PAYMENT_PLAN") ||
-        intent.includes("ROI_DETAILS")
-      ) {
-        const propertyName = parameters.propertyName || "";
-        const foundProp = allProperties.find((p) =>
-          p.Property.location.toLowerCase().includes(propertyName.toLowerCase())
-        );
-
-        if (foundProp) {
-          const prop = foundProp.Property;
-          if (intent === "PAYMENT_PLAN_INQUIRY") {
-            summaryTextToSpeak = `The payment plan for the property in ${
-              prop.location
-            } is: ${prop.paymentPlan || "Details not available."}`;
-          } else if (intent === "ROI_DETAILS_INQUIRY") {
-            summaryTextToSpeak = `For the property in ${
-              prop.location
-            }, the Total ROI is ${prop.roi.totalROI}%, Annual ROI is ${
-              prop.roi.annualROI
-            }%, and the projected value is $${prop.roi.projectedValue.toLocaleString()}.`;
-          } else {
-            // General inquiry
-            summaryTextToSpeak = `Here are more details for the property in ${prop.location}: It's a ${prop.type} unit with ${prop.bedrooms} bedrooms, a total area of ${prop.totalArea}, and a market risk rated as '${prop.riskAssessment.marketRisk}'.`;
-          }
-        } else {
-          summaryTextToSpeak =
-            "I'm sorry, I couldn't find a specific property matching that name. Could you be more specific?";
-        }
-      }
-      // C. Handle complex search intents that use the vector store
-      else {
-        const filterFn = (doc) => {
-          const meta = doc.metadata;
-          if (
-            parameters.minPrice &&
-            (meta.priceRange.min || 0) < parameters.minPrice
-          )
-            return false;
-          if (
-            parameters.maxPrice &&
-            (meta.priceRange.min || Infinity) > parameters.maxPrice
-          )
-            return false;
-          if (parameters.minRooms && (meta.bedrooms || 0) < parameters.minRooms)
-            return false;
-          if (
-            parameters.maxRooms &&
-            (meta.bedrooms || Infinity) > parameters.maxRooms
-          )
-            return false;
-          if (parameters.minArea && (meta.totalArea || 0) < parameters.minArea)
-            return false;
-          if (
-            parameters.maxArea &&
-            (meta.totalArea || Infinity) > parameters.maxArea
-          )
-            return false;
-          if (
-            parameters.type &&
-            !new RegExp(parameters.type, "i").test(meta.type)
-          )
-            return false;
-          if (
-            parameters.deliveryYear &&
-            !meta.delivery.includes(String(parameters.deliveryYear))
-          )
-            return false;
-          return true;
-        };
-
-        const searchResults = await vectorStore.similaritySearch(
-          userQuery,
-          3,
-          filterFn
-        );
-        suggestionsForUI = searchResults.map((result) => ({
-          Property: result.metadata,
-          uniqueId: result.metadata.uniqueId, // Pass the ID to the frontend
-        }));
-      }
-
-      // --- 3. Generate Final Summary ---
-      if (suggestionsForUI.length > 0 && !summaryTextToSpeak) {
-        const thinkingPrompt = `
-          You are an expert real estate AI. Based on the user's query ("${userQuery}") and the best matching property below, generate a single, concise sentence.
-          **RULES:**
-          1. BE BRIEF: Under 20 words.
-          2. BE PERSUASIVE: Briefly mention the key reason it's a good match.
-          3. GET TO THE POINT: No "I found..." or "Based on your query...".
-          **BEST MATCH DATA:**
-          ---
-          ${JSON.stringify(suggestionsForUI[0])}
-          ---
-        `;
-        const thinkingResult = await model.generateContent(thinkingPrompt);
-        summaryTextToSpeak = thinkingResult.response.text().trim();
-      } else if (!summaryTextToSpeak) {
-        summaryTextToSpeak =
-          "I couldn't find any properties that matched your criteria.";
-      }
-    }
+    const { summary, suggestions, entity } = await runConversation(
+      userQuery,
+      chatHistory || []
+    );
 
     res.json({
-      suggestions: suggestionsForUI,
+      suggestions,
       transcript: userQuery,
-      summary: summaryTextToSpeak,
+      summary,
+      entity,
     });
   } catch (error) {
     console.error("Error in /api/chat:", error);
+    if (error.message.includes("503")) {
+      return res
+        .status(503)
+        .json({
+          error:
+            "The AI service is currently overloaded. Please try again in a moment.",
+        });
+    }
+    if (error instanceof SyntaxError) {
+      return res
+        .status(500)
+        .json({
+          error:
+            "I had a little trouble understanding that. Could you please rephrase?",
+        });
+    }
     res.status(500).send("An internal error occurred.");
   }
 });
 
-// --- AI Investment Analysis Endpoint ---
+app.post("/api/chat-speech", upload.single("audio"), async (req, res) => {
+  let rawTranscript = "";
+  try {
+    if (!req.file) return res.status(400).send("No audio file uploaded.");
+    if (!req.body.metadata)
+      return res.status(400).send("Missing metadata field.");
+
+    console.log("\n--- New request on /api/chat-speech ---");
+    let metadata;
+    try {
+      metadata = JSON.parse(req.body.metadata);
+    } catch (e) {
+      return res.status(400).send("Invalid metadata format.");
+    }
+    const { chatHistory } = metadata;
+
+    const audioBuffer = req.file.buffer;
+    const audioPart = {
+      inlineData: {
+        data: audioBuffer.toString("base64"),
+        mimeType: req.file.mimetype,
+      },
+    };
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); // Use flash for fast STT
+    const sttResult = await generateWithRetry(model, [
+      "Transcribe this real estate query:",
+      audioPart,
+    ]);
+
+    rawTranscript = sttResult.response.text().trim();
+    console.log(`Raw transcribed query: "${rawTranscript}"`);
+    const userQuery = rawTranscript.replace(/\[.*?\]|\(.*?\)/g, "").trim();
+    console.log(`Cleaned query: "${userQuery}"`);
+
+    if (!userQuery) {
+      return res.json({
+        suggestions: [],
+        transcript: rawTranscript,
+        summary: "Sorry, I didn't catch a clear question. Could you try again?",
+      });
+    }
+
+    const { summary, suggestions, entity } = await runConversation(
+      userQuery,
+      chatHistory || []
+    );
+    res.json({ suggestions, transcript: rawTranscript, summary, entity });
+  } catch (error) {
+    console.error("Error in /api/chat-speech:", error);
+    if (error.message.includes("503")) {
+      return res
+        .status(503)
+        .json({
+          error:
+            "The AI service is currently overloaded. Please try again in a moment.",
+        });
+    }
+    if (error instanceof SyntaxError) {
+      return res.status(500).json({
+        summary:
+          "I had a little trouble understanding that request. Could you please rephrase it?",
+        transcript: rawTranscript,
+        suggestions: [],
+      });
+    }
+    res.status(500).send("An internal error occurred.");
+  }
+});
+
 app.post("/api/analyze-properties", async (req, res) => {
   const { ids } = req.body;
 
@@ -356,8 +405,6 @@ app.post("/api/analyze-properties", async (req, res) => {
       .status(400)
       .json({ error: "An array of property IDs is required." });
   }
-
-  console.log(`Received analysis request for ${ids.length} properties.`);
 
   try {
     const selectedProperties = allProperties.filter((p) =>
@@ -382,28 +429,21 @@ app.post("/api/analyze-properties", async (req, res) => {
     }));
 
     const analysisPrompt = `
-      **Persona:** You are an expert real estate investment analyst providing a concise, professional comparison for a client.
+        **Persona:** You are an expert real estate investment analyst providing a concise, professional comparison for a client.
+        **Context:** You are analyzing the following properties:
+        ---
+        ${JSON.stringify(propertiesForPrompt, null, 2)}
+        ---
+        **Goal:** Perform a comparative analysis and provide a clear recommendation. Follow these steps precisely:
+        1.  **Best Overall Investment:** Identify the single best property for a balanced investment based on a combination of the highest Total ROI and the lowest Market Risk. State the location and explain your choice in one or two sentences.
+        2.  **Highest Growth Potential:** Identify the single property with the absolute highest 'projectedValue'. State the location and its projected value.
+        3.  **Property Summaries:** Provide a brief, one-sentence summary for *each* property, highlighting its main advantage or disadvantage.
+        **Format:** Structure your response using Markdown. Use headings (e.g., "### Best Overall Investment"), bullet points, and bold text for property locations and key metrics. Do not include any introductory or concluding pleasantries.
+      `;
 
-      **Context:** You are analyzing the following ${
-        propertiesForPrompt.length
-      } properties:
-      ---
-      ${JSON.stringify(propertiesForPrompt, null, 2)}
-      ---
-
-      **Goal:** Your task is to perform a comparative analysis and provide a clear recommendation. Follow these steps precisely:
-      1.  **Best Overall Investment:** Identify the single best property for a balanced investment. Your reasoning *must* be based on a combination of the highest Total ROI and the lowest Market Risk. State the location and explain your choice in one or two sentences.
-      2.  **Highest Growth Potential:** Identify the single property with the absolute highest 'projectedValue'. State the location and its projected value.
-      3.  **Property Summaries:** Provide a brief, one-sentence summary for *each* property, highlighting its main advantage or disadvantage (e.g., "Suite 57 offers the best ROI but comes with high market risk.").
-
-      **Format:** Structure your response using Markdown. Use headings (e.g., "### Best Overall Investment"), bullet points for the summaries, and bold text for property locations and key metrics. Do not include any introductory or concluding pleasantries.
-    `;
-
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-lite" });
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); // Using stable model
     const result = await model.generateContent(analysisPrompt);
     const analysisText = result.response.text();
-
-    console.log("Successfully generated AI analysis.");
 
     res.json({ analysis: analysisText });
   } catch (error) {
